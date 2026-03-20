@@ -150,12 +150,17 @@ function gatewayAgentCall(agentId, message, timeoutMs = 30000) {
             type: "req",
             id: agentReqId,
             method: "agent",
-            params: { agentId, message, idempotencyKey: randomUUID() }
+            params: {
+              agentId,
+              message,
+              idempotencyKey: randomUUID(),
+              timeout: Math.floor(timeoutMs / 1000),
+            }
           }));
           return;
         }
 
-        // Step 3: Agent response
+        // Step 3: Agent response (may come as accepted first, then final)
         if (msg.type === "res" && msg.id === agentReqId) {
           if (msg.ok) {
             const payload = msg.payload;
@@ -164,6 +169,12 @@ function gatewayAgentCall(agentId, message, timeoutMs = 30000) {
           } else {
             done(new Error(msg.error?.message || "agent error"));
           }
+          return;
+        }
+
+        // Agent result can also arrive as an event
+        if (msg.type === "event" && msg.event === "agent.done") {
+          done(null, msg.payload);
           return;
         }
 
