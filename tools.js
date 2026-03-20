@@ -123,6 +123,64 @@ function extractSessionId(result) {
   return null;
 }
 
+// ── Clawdi Admin API ────────────────────────────────────────────────────
+
+const CLAWDI_API = "https://api.clawdi.ai/admin";
+const CLAWDI_KEY = "007e2657ab7646d0f75901d58c79cf1324d2df89eed48840c3aff4fab50d41f4";
+
+async function clawdiGet(path) {
+  const res = await fetch(`${CLAWDI_API}${path}`, {
+    headers: { "X-Admin-API-Key": CLAWDI_KEY },
+  });
+  if (!res.ok) throw new Error(`Clawdi API ${res.status}`);
+  return res.json();
+}
+
+async function handleClawdiMetrics(query, log) {
+  if (query.match(/new|signup|growth|recent/i)) {
+    const [users, usage24h, usage7d] = await Promise.all([
+      clawdiGet("/users?limit=1"),
+      clawdiGet("/usage/global?days=1"),
+      clawdiGet("/usage/global?days=7"),
+    ]);
+    const active24h = usage24h.items?.reduce((s, i) => Math.max(s, i.unique_users || 0), 0) || 0;
+    const active7d = usage7d.items?.reduce((s, i) => Math.max(s, i.unique_users || 0), 0) || 0;
+    const reqs24h = usage24h.items?.reduce((s, i) => s + (i.requests || 0), 0) || 0;
+    return `Clawdi: ${users.count} total users. Last 24h: ${active24h} active, ${reqs24h.toLocaleString()} requests. Last 7d: ${active7d} unique active.`;
+  }
+
+  if (query.match(/deploy/i)) {
+    const data = await clawdiGet("/deployments?limit=1");
+    return `Active deployments: ${data.count || 0}`;
+  }
+
+  if (query.match(/model/i)) {
+    const data = await clawdiGet("/usage/by-model?days=7");
+    const lines = (data.items || []).slice(0, 10).map((m) =>
+      `${m.model || m.name}: ${(m.requests || 0).toLocaleString()} reqs`);
+    return `Usage by model (7d):\n${lines.join("\n")}`;
+  }
+
+  if (query.match(/top/i)) {
+    const data = await clawdiGet("/usage/users?days=7&limit=10");
+    const lines = (data.items || []).slice(0, 10).map((u, i) =>
+      `${i + 1}. ${u.name || u.user_id}: ${(u.requests || 0).toLocaleString()} reqs`);
+    return `Top users (7d): ${lines.join(", ")}`;
+  }
+
+  // Default: overview
+  const [users, usage] = await Promise.all([
+    clawdiGet("/users?limit=5000"),
+    clawdiGet("/usage/global?days=1"),
+  ]);
+  const plans = {};
+  for (const u of users.items || []) plans[u.plan || "free"] = (plans[u.plan || "free"] || 0) + 1;
+  const breakdown = Object.entries(plans).map(([p, c]) => `${p}: ${c}`).join(", ");
+  const totalReqs = usage.items?.reduce((s, i) => s + (i.requests || 0), 0) || 0;
+  const activeUsers = usage.items?.reduce((s, i) => Math.max(s, i.unique_users || 0), 0) || 0;
+  return `Clawdi: ${users.count} users (${breakdown}). ${activeUsers} active today, ${totalReqs.toLocaleString()} requests (24h).`;
+}
+
 // ── Main handler ────────────────────────────────────────────────────────
 
 export async function handleFunctionCall(name, argsJson, log) {
@@ -242,15 +300,96 @@ export async function handleFunctionCall(name, argsJson, log) {
       if (!task) return "No task provided.";
 
       log.info(`OpenClaw backend: ${task}`);
+      const t = task.toLowerCase();
 
+      // ── Fast paths: direct API/script calls for common queries ──
+
+      // Clawdi metrics
+      if (t.match(/clawdi|clawdy|cloudy/i) && t.match(/user|signup|growth|metric|plan|deploy|active|new/i)) {
+        try {
+          return await handleClawdiMetrics(t, log);
+        } catch (err) {
+          log.error(`Clawdi metrics error: ${err.message}`);
+          return `Clawdi API error: ${err.message}`;
+        }
+      }
+
+      // Phala / RedPill metrics
+      if (t.match(/phala|redpill|red pill|cvm/i) && t.match(/metric|usage|request|user|model|mrr|signup/i)) {
+        try {
+          const daysMatch = t.match(/(\d+)\s*(?:day|hour)/i);
+          const days = daysMatch ? parseInt(daysMatch[1]) : 1;
+          const result = await runScript("node", [
+            "/root/.openclaw/workspace/skills/phala-redpill-metrics/scripts/check-metrics.js",
+            "--days", String(days),
+          ], 25000);
+          const p = JSON.parse(result);
+          return p.ok && p.report_markdown ? p.report_markdown : result;
+        } catch (err) {
+          return `Phala metrics error: ${err.message}`;
+        }
+      }
+
+      // Crypto portfolio
+      if (t.match(/crypto|bitcoin|btc|eth|pha|token|holdings/i) && t.match(/portfolio|holdings|balance|price|position/i)) {
+        try {
+          const result = await runScript("node", [
+            "/root/.openclaw/skills/portfolio-watch/scripts/check-portfolio.mjs",
+          ], 20000);
+          const p = JSON.parse(result);
+          if (!p.ok) return `Portfolio error: ${p.error || "unknown"}`;
+          const total = Math.round(p.totalUsd || 0).toLocaleString();
+          const positions = (p.positions || []).slice(0, 8);
+          const lines = positions.map((pos) => {
+            const val = Math.round(pos.valueUsd).toLocaleString();
+            const ch = pos.change24hPct ? ` (${pos.change24hPct > 0 ? "+" : ""}${pos.change24hPct.toFixed(1)}% 24h)` : "";
+            return `${pos.symbol}: $${val}${ch}`;
+          });
+          return `Crypto portfolio: $${total} total\n${lines.join("\n")}`;
+        } catch (err) {
+          return `Portfolio error: ${err.message}`;
+        }
+      }
+
+      // Stock portfolio / market quotes
+      if (t.match(/stock|short|portfolio|position|trade/i) && !t.match(/crypto/i)) {
+        try {
+          const dir = "/root/.openclaw/skills/short-scanner/scripts";
+          const tickerMatch = t.match(/quote\s+(?:for\s+)?(\w+)/i) || t.match(/price\s+(?:of\s+)?(\w+)/i);
+          if (tickerMatch) {
+            return await runScript("node", [`${dir}/trade.js`, "--quote", tickerMatch[1].toUpperCase()]);
+          }
+          return await runScript("node", [`${dir}/trade.js`, "--portfolio"]);
+        } catch (err) {
+          return `Stock data error: ${err.message}`;
+        }
+      }
+
+      // Cron status
+      if (t.match(/cron|scheduled|job/i)) {
+        try {
+          const { readFileSync } = await import("node:fs");
+          const jobs = JSON.parse(readFileSync("/data/openclaw/cron/jobs.json", "utf-8"));
+          return jobs.map((j) => {
+            const status = j.consecutiveErrors > 0
+              ? `ERROR (${j.consecutiveErrors} failures)`
+              : j.lastRunAt ? "OK" : "never run";
+            return `${j.name}: ${status}, next: ${j.nextRunAt || "unknown"}`;
+          }).join("\n");
+        } catch (err) {
+          return `Cron error: ${err.message}`;
+        }
+      }
+
+      // ── Fallback: openclaw CLI (slow — gateway WS + embedded fallback) ──
       try {
         const result = await runScript("openclaw", [
           "agent",
           "--agent", "main",
           "--message", task,
           "--json",
-          "--timeout", "45",
-        ], 50000);
+          "--timeout", "60",
+        ], 90000);
 
         try {
           const parsed = JSON.parse(result);
