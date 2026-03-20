@@ -359,7 +359,7 @@ export async function handleFunctionCall(name, argsJson, log) {
       log.info(`OpenClaw backend: ${task}`);
 
       try {
-        const result = await gatewayAgentCall("main", task, 30000);
+        const result = await gatewayAgentCall("main", task, 60000);
         log.info(`OpenClaw result: ${JSON.stringify(result).slice(0, 300)}`);
 
         // Extract the reply text from the agent response
