@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { createSign, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
 import { config } from "./config.js";
 
@@ -85,28 +85,6 @@ function runScript(cmd, args = [], timeoutMs = 15000) {
 // ── OpenClaw Gateway RPC (direct WS, bypasses CLI) ─────────────────────
 
 const GW_URL = "ws://127.0.0.1:18789";
-let gwDeviceIdentity = null;
-
-function loadDeviceIdentity() {
-  if (gwDeviceIdentity) return gwDeviceIdentity;
-  try {
-    const dir = "/root/.openclaw/device";
-    const deviceId = readFileSync(`${dir}/device-id`, "utf-8").trim();
-    const privateKeyPem = readFileSync(`${dir}/private.pem`, "utf-8");
-    const publicKeyPem = readFileSync(`${dir}/public.pem`, "utf-8");
-    // Convert public key PEM to raw base64url
-    const pubDer = publicKeyPem.replace(/-----[^-]+-----/g, "").replace(/\s/g, "");
-    const pubBuf = Buffer.from(pubDer, "base64");
-    // Raw 32-byte key is last 32 bytes of the DER
-    const rawPub = pubBuf.subarray(pubBuf.length - 32);
-    const publicKeyB64url = rawPub.toString("base64url");
-    gwDeviceIdentity = { deviceId, privateKeyPem, publicKeyPem, publicKeyB64url };
-    return gwDeviceIdentity;
-  } catch {
-    return null;
-  }
-}
-
 function loadGatewayToken() {
   try {
     const cfg = JSON.parse(readFileSync("/root/.openclaw/openclaw.json", "utf-8"));
@@ -116,28 +94,14 @@ function loadGatewayToken() {
   }
 }
 
-function loadDeviceToken(deviceId, role = "operator") {
-  try {
-    const store = JSON.parse(readFileSync("/root/.openclaw/device/device-auth-store.json", "utf-8"));
-    const key = `${deviceId}:${role}`;
-    return store[key]?.token || null;
-  } catch {
-    return null;
-  }
-}
-
-function signPayload(privateKeyPem, payload) {
-  const sign = createSign("SHA256");
-  sign.update(payload);
-  return sign.sign(privateKeyPem, "base64url");
-}
-
 function gatewayAgentCall(agentId, message, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
-    const device = loadDeviceIdentity();
     const gatewayToken = loadGatewayToken();
     const ws = new WebSocket(GW_URL, { maxPayload: 25 * 1024 * 1024 });
     let settled = false;
+    let connectId = null;
+    let agentReqId = null;
+
     const done = (err, result) => {
       if (settled) return;
       settled = true;
@@ -151,92 +115,65 @@ function gatewayAgentCall(agentId, message, timeoutMs = 30000) {
     ws.on("close", () => { if (!settled) done(new Error("gateway closed")); });
 
     ws.on("message", (raw) => {
-      const msg = JSON.parse(raw.toString());
+      try {
+        const msg = JSON.parse(raw.toString());
 
-      // Step 1: Challenge → send connect
-      if (msg.type === "event" && msg.event === "connect.challenge") {
-        const nonce = msg.payload?.nonce;
-        const role = "operator";
-        const scopes = ["operator.admin"];
-        const signedAtMs = Date.now();
-
-        // Build device auth payload (v3)
-        let devicePayload = null;
-        if (device) {
-          const payloadStr = JSON.stringify({
-            deviceId: device.deviceId,
-            clientId: "voice-agent",
-            clientMode: "backend",
-            role,
-            scopes,
-            signedAtMs,
-            token: gatewayToken || null,
-            nonce,
-            platform: "linux"
-          });
-          const signature = signPayload(device.privateKeyPem, payloadStr);
-          devicePayload = {
-            id: device.deviceId,
-            publicKey: device.publicKeyB64url,
-            signature,
-            signedAt: signedAtMs,
-            nonce
-          };
+        // Step 1: Challenge → send connect with token auth
+        if (msg.type === "event" && msg.event === "connect.challenge") {
+          connectId = randomUUID();
+          ws.send(JSON.stringify({
+            type: "req",
+            id: connectId,
+            method: "connect",
+            params: {
+              minProtocol: 3,
+              maxProtocol: 3,
+              client: {
+                id: "gateway-client",
+                version: "1.0.0",
+                platform: "linux",
+                mode: "backend"
+              },
+              caps: [],
+              auth: gatewayToken ? { token: gatewayToken } : undefined,
+              role: "operator",
+              scopes: ["operator.admin"]
+            }
+          }));
+          return;
         }
 
-        const deviceToken = device ? loadDeviceToken(device.deviceId) : null;
-        const authToken = gatewayToken || deviceToken || undefined;
+        // Step 2: Connect response (hello) → send agent request
+        if (msg.type === "res" && msg.id === connectId && msg.ok) {
+          agentReqId = randomUUID();
+          ws.send(JSON.stringify({
+            type: "req",
+            id: agentReqId,
+            method: "agent",
+            params: { agentId, message }
+          }));
+          return;
+        }
 
-        ws.send(JSON.stringify({
-          type: "req",
-          id: randomUUID(),
-          method: "connect",
-          params: {
-            minProtocol: 3,
-            maxProtocol: 3,
-            client: {
-              id: "voice-agent",
-              version: "1.0.0",
-              platform: "linux",
-              mode: "backend"
-            },
-            caps: [],
-            auth: authToken ? { token: authToken } : undefined,
-            role,
-            scopes,
-            device: devicePayload
+        // Step 3: Agent response
+        if (msg.type === "res" && msg.id === agentReqId) {
+          if (msg.ok) {
+            const payload = msg.payload;
+            if (payload?.status === "accepted") return; // wait for final
+            done(null, payload);
+          } else {
+            done(new Error(msg.error?.message || "agent error"));
           }
-        }));
-        return;
-      }
+          return;
+        }
 
-      // Step 2: Hello → send agent request
-      if (msg.type === "event" && msg.event === "hello") {
-        ws.send(JSON.stringify({
-          type: "req",
-          id: randomUUID(),
-          method: "agent",
-          params: {
-            agentId,
-            message,
-            json: true
-          }
-        }));
-        return;
-      }
-
-      // Step 3: Response
-      if (msg.type === "res" && msg.ok) {
-        const payload = msg.payload;
-        // Agent responses can be accepted (in progress) or final
-        if (payload?.status === "accepted") return; // wait for final
-        done(null, payload);
-        return;
-      }
-
-      if (msg.type === "res" && !msg.ok) {
-        done(new Error(msg.error?.message || "gateway error"));
-        return;
+        // Handle connect error
+        if (msg.type === "res" && msg.id === connectId && !msg.ok) {
+          done(new Error(msg.error?.message || "connect failed"));
+          return;
+        }
+      } catch (e) {
+        done(e);
       }
     });
   });
