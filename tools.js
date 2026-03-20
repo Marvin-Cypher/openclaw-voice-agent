@@ -150,7 +150,7 @@ function gatewayAgentCall(agentId, message, timeoutMs = 30000) {
             type: "req",
             id: agentReqId,
             method: "agent",
-            params: { agentId, message }
+            params: { agentId, message, idempotencyKey: randomUUID() }
           }));
           return;
         }
@@ -289,7 +289,11 @@ export async function handleFunctionCall(name, argsJson, log) {
     // ── LAYER 1b: Execute a Composio tool ──
     case "execute_tool": {
       const slug = args.tool_slug;
-      const toolArgs = args.arguments || {};
+      // Model may pass args inside "arguments" object or at top level
+      const toolArgs = args.arguments || (() => {
+        const { tool_slug, ...rest } = args;
+        return Object.keys(rest).length > 0 ? rest : {};
+      })();
 
       if (!slug) return "Missing tool_slug. Call search_tools first.";
 
